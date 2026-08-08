@@ -325,8 +325,14 @@ func TestMetricsNameLabel(t *testing.T) {
 
 func TestLockMeterEmpty(t *testing.T) {
 	m := &LockMeter{}
-	if ms := m.Metrics(nil); len(ms) != 0 {
-		t.Fatalf("empty meter metrics = %+v, want none", ms)
+	ms := m.Metrics(nil)
+	if len(ms) != 4 {
+		t.Fatalf("empty meter metrics = %+v, want 4 zero counters", ms)
+	}
+	for _, s := range ms {
+		if s.Value != 0 {
+			t.Fatalf("%s = %v, want 0", s.Name, s.Value)
+		}
 	}
 }
 
@@ -338,7 +344,7 @@ func TestLockMeterMetrics(t *testing.T) {
 	m.IncUnlockOK()
 	m.IncUnlockMismatch()
 
-	labels := map[string]string{"name": "cache", "addresses": "127.0.0.1:6379"}
+	labels := map[string]string{"component": "cache", "addresses": "127.0.0.1:6379"}
 	ms := m.Metrics(labels)
 	if len(ms) != 4 {
 		t.Fatalf("metrics = %+v, want 4 samples", ms)
@@ -350,17 +356,17 @@ func TestLockMeterMetrics(t *testing.T) {
 		}
 		got[s.Name] = s.Value
 	}
-	if got["lock_acquire_ok_total"] != 2 {
-		t.Fatalf("lock_acquire_ok_total = %v, want 2", got["lock_acquire_ok_total"])
+	if got["valkey_lock_acquire_ok_total"] != 2 {
+		t.Fatalf("valkey_lock_acquire_ok_total = %v, want 2", got["valkey_lock_acquire_ok_total"])
 	}
-	if got["lock_acquire_busy_total"] != 1 {
-		t.Fatalf("lock_acquire_busy_total = %v, want 1", got["lock_acquire_busy_total"])
+	if got["valkey_lock_acquire_busy_total"] != 1 {
+		t.Fatalf("valkey_lock_acquire_busy_total = %v, want 1", got["valkey_lock_acquire_busy_total"])
 	}
-	if got["lock_unlock_ok_total"] != 1 {
-		t.Fatalf("lock_unlock_ok_total = %v, want 1", got["lock_unlock_ok_total"])
+	if got["valkey_lock_unlock_ok_total"] != 1 {
+		t.Fatalf("valkey_lock_unlock_ok_total = %v, want 1", got["valkey_lock_unlock_ok_total"])
 	}
-	if got["lock_unlock_mismatch_total"] != 1 {
-		t.Fatalf("lock_unlock_mismatch_total = %v, want 1", got["lock_unlock_mismatch_total"])
+	if got["valkey_lock_unlock_mismatch_total"] != 1 {
+		t.Fatalf("valkey_lock_unlock_mismatch_total = %v, want 1", got["valkey_lock_unlock_mismatch_total"])
 	}
 
 	labels["mutated"] = "x"

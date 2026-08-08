@@ -202,10 +202,10 @@ func TestMutexMetrics(t *testing.T) {
 	}
 
 	want := map[string]float64{
-		"lock_acquire_ok_total":      2,
-		"lock_acquire_busy_total":    1,
-		"lock_unlock_ok_total":       1,
-		"lock_unlock_mismatch_total": 1,
+		"valkey_lock_acquire_ok_total":      2,
+		"valkey_lock_acquire_busy_total":    1,
+		"valkey_lock_unlock_ok_total":       1,
+		"valkey_lock_unlock_mismatch_total": 1,
 	}
 	got := make(map[string]float64)
 	for _, s := range vk.Metrics() {

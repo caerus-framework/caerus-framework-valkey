@@ -152,7 +152,7 @@ sessionsClient := cf.MustGetByName[*cf_valkey.CFValkey](fw, "sessions").Client()
 
 When multiple instances exist, `cf.Get[*cf_valkey.CFValkey](fw)` returns `false`
 to prevent ambiguous lookups. Always use `GetByName` for named instances. Each
-instance's metrics carry a `name` label (e.g. `valkey_info{name="cache"}`).
+instance's metrics carry a `component` label (e.g. `valkey_info{component="cache"}`).
 
 ## Configuration
 
@@ -221,19 +221,21 @@ contributes samples to `/metrics`:
 
 | Sample | Type | Labels |
 |---|---|---|
-| `valkey_info` | gauge | `addresses`, `db`, `name` (when `WithName`) |
+| `valkey_info` | gauge | `addresses`, `db`, `component` |
 | `valkey_ping_failures_total` | counter | same |
 | `valkey_reconnects_total` | counter | same |
-| `lock_acquire_ok_total` | counter | same |
-| `lock_acquire_busy_total` | counter | same |
-| `lock_unlock_ok_total` | counter | same |
-| `lock_unlock_mismatch_total` | counter | same |
+| `valkey_lock_acquire_ok_total` | counter | same |
+| `valkey_lock_acquire_busy_total` | counter | same |
+| `valkey_lock_unlock_ok_total` | counter | same |
+| `valkey_lock_unlock_mismatch_total` | counter | same |
 
-The `lock_*` counters aggregate distributed-lock traffic from `patterns.Mutex`
-across the component instance (per-lock breakdown is out of scope to keep
-cardinality bounded).
+The `valkey_lock_*` counters aggregate distributed-lock traffic from
+`patterns.Mutex` across the component instance (per-lock breakdown is out of
+scope to keep the lock helpers dependency-free and cardinality bounded).
 
-Before `Init` or after `Shutdown` it reports nothing (lazy pickup). Counter
+Before `Init` or after `Shutdown` it reports nothing (lazy pickup). While
+connected, the ping, reconnect, and lock counters are always emitted (zero
+until first fire), so the series stay present on `/metrics`. Counter
 samples use `cf_observability.MetricTypeCounter` and are scraped as Prometheus
 counters (not gauges). The metrics contract lives in
 [`caerus-framework-observability`](https://github.com/caerus-framework/caerus-framework-observability),
@@ -313,8 +315,8 @@ err := m.WithLock(ctx, func(ctx context.Context) error {
 `TryLock` / `Unlock` are also available. TTL is mandatory; token-based unlock
 (Lua) ensures you never delete another holder's lock. **Not Redlock** — see
 godoc for failure modes. Lock traffic is counted and exposed on `/metrics`
-(`lock_acquire_ok_total`, `lock_acquire_busy_total`,
-`lock_unlock_ok_total`, `lock_unlock_mismatch_total`), so
+(`valkey_lock_acquire_ok_total`, `valkey_lock_acquire_busy_total`,
+`valkey_lock_unlock_ok_total`, `valkey_lock_unlock_mismatch_total`), so
 contention and lost unlocks are observable without ad-hoc instrumentation.
 
 ### JSON helpers

@@ -701,9 +701,7 @@ func (c *CFValkey) Metrics() []cf_observability.Metric {
 	labels := map[string]string{
 		"addresses": strings.Join(c.opts.InitAddress, ","),
 		"db":        strconv.Itoa(c.opts.SelectDB),
-	}
-	if c.name != "" {
-		labels["name"] = c.name
+		"component": c.Name(),
 	}
 	metrics := []cf_observability.Metric{{
 		Name:   "valkey_info",
@@ -711,24 +709,22 @@ func (c *CFValkey) Metrics() []cf_observability.Metric {
 		Value:  1,
 		Labels: copyLabels(labels),
 	}}
-	if v := c.pingFailures.Load(); v > 0 {
-		metrics = append(metrics, cf_observability.Metric{
+	metrics = append(metrics,
+		cf_observability.Metric{
 			Name:   "valkey_ping_failures_total",
 			Help:   "Total number of failed connectivity pings.",
-			Value:  float64(v),
+			Value:  float64(c.pingFailures.Load()),
 			Labels: copyLabels(labels),
 			Type:   cf_observability.MetricTypeCounter,
-		})
-	}
-	if v := c.reconnects.Load(); v > 0 {
-		metrics = append(metrics, cf_observability.Metric{
+		},
+		cf_observability.Metric{
 			Name:   "valkey_reconnects_total",
 			Help:   "Total number of successful reconnects after config reload.",
-			Value:  float64(v),
+			Value:  float64(c.reconnects.Load()),
 			Labels: copyLabels(labels),
 			Type:   cf_observability.MetricTypeCounter,
-		})
-	}
+		},
+	)
 	metrics = append(metrics, c.lockMeter.Metrics(labels)...)
 	return metrics
 }
@@ -736,14 +732,15 @@ func (c *CFValkey) Metrics() []cf_observability.Metric {
 // LockMeter returns the component's shared lock-traffic meter. Distributed
 // lock helpers in the patterns subpackage feed it via this accessor; the
 // totals ride the component's Metrics() output (aggregated per component
-// instance, disambiguated by the name label).
+// instance, disambiguated by the component label).
 func (c *CFValkey) LockMeter() *LockMeter { return c.lockMeter }
 
 // LockMeter aggregates distributed-lock traffic counters for one valkey
 // component. Mutexes created against the component increment it through
 // LockMeter(); CFValkey.Metrics() then exposes the totals on /metrics as
 // Prometheus counters. Counters are cumulative and only increase for the
-// process lifetime (lazy pickup: samples appear once a lock has fired).
+// process lifetime and are emitted (zero until first increment) while the
+// component is connected.
 type LockMeter struct {
 	acquireOK      atomic.Uint64
 	acquireBusy    atomic.Uint64
@@ -764,47 +761,41 @@ func (m *LockMeter) IncUnlockOK() { m.unlockOK.Add(1) }
 // lock (expired or stolen).
 func (m *LockMeter) IncUnlockMismatch() { m.unlockMismatch.Add(1) }
 
-// Metrics renders the meter's non-zero counters, each carrying a copy of the
-// caller's labels so the lock series share the component's identity.
+// Metrics renders the meter's four counters, each carrying a copy of the
+// caller's labels so the lock series share the component's identity. Counters
+// are emitted while the component is connected (zero until first fired), so
+// the series are always present on /metrics.
 func (m *LockMeter) Metrics(labels map[string]string) []cf_observability.Metric {
-	metrics := make([]cf_observability.Metric, 0, 4)
-	if v := m.acquireOK.Load(); v > 0 {
-		metrics = append(metrics, cf_observability.Metric{
-			Name:   "lock_acquire_ok_total",
+	return []cf_observability.Metric{
+		{
+			Name:   "valkey_lock_acquire_ok_total",
 			Help:   "Total number of successful distributed lock acquisitions.",
-			Value:  float64(v),
+			Value:  float64(m.acquireOK.Load()),
 			Labels: copyLabels(labels),
 			Type:   cf_observability.MetricTypeCounter,
-		})
-	}
-	if v := m.acquireBusy.Load(); v > 0 {
-		metrics = append(metrics, cf_observability.Metric{
-			Name:   "lock_acquire_busy_total",
+		},
+		{
+			Name:   "valkey_lock_acquire_busy_total",
 			Help:   "Total number of distributed lock acquisitions rejected because the lock was held.",
-			Value:  float64(v),
+			Value:  float64(m.acquireBusy.Load()),
 			Labels: copyLabels(labels),
 			Type:   cf_observability.MetricTypeCounter,
-		})
-	}
-	if v := m.unlockOK.Load(); v > 0 {
-		metrics = append(metrics, cf_observability.Metric{
-			Name:   "lock_unlock_ok_total",
+		},
+		{
+			Name:   "valkey_lock_unlock_ok_total",
 			Help:   "Total number of successful distributed lock releases.",
-			Value:  float64(v),
+			Value:  float64(m.unlockOK.Load()),
 			Labels: copyLabels(labels),
 			Type:   cf_observability.MetricTypeCounter,
-		})
-	}
-	if v := m.unlockMismatch.Load(); v > 0 {
-		metrics = append(metrics, cf_observability.Metric{
-			Name:   "lock_unlock_mismatch_total",
+		},
+		{
+			Name:   "valkey_lock_unlock_mismatch_total",
 			Help:   "Total number of distributed lock releases where the caller no longer owned the lock (expired or stolen).",
-			Value:  float64(v),
+			Value:  float64(m.unlockMismatch.Load()),
 			Labels: copyLabels(labels),
 			Type:   cf_observability.MetricTypeCounter,
-		})
+		},
 	}
-	return metrics
 }
 
 // copyLabels returns a shallow copy of a label map so callers cannot mutate
