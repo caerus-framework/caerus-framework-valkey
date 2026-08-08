@@ -152,7 +152,7 @@ sessionsClient := cf.MustGetByName[*cf_valkey.CFValkey](fw, "sessions").Client()
 
 When multiple instances exist, `cf.Get[*cf_valkey.CFValkey](fw)` returns `false`
 to prevent ambiguous lookups. Always use `GetByName` for named instances. Each
-instance's metrics carry a `name` label (e.g. `caerus_valkey_info{name="cache"}`).
+instance's metrics carry a `name` label (e.g. `valkey_info{name="cache"}`).
 
 ## Configuration
 
@@ -221,13 +221,13 @@ contributes samples to `/metrics`:
 
 | Sample | Type | Labels |
 |---|---|---|
-| `caerus_valkey_info` | gauge | `addresses`, `db`, `name` (when `WithName`) |
-| `caerus_valkey_ping_failures_total` | counter | same |
-| `caerus_valkey_reconnects_total` | counter | same |
-| `caerus_lock_acquire_ok_total` | counter | same |
-| `caerus_lock_acquire_busy_total` | counter | same |
-| `caerus_lock_unlock_ok_total` | counter | same |
-| `caerus_lock_unlock_mismatch_total` | counter | same |
+| `valkey_info` | gauge | `addresses`, `db`, `name` (when `WithName`) |
+| `valkey_ping_failures_total` | counter | same |
+| `valkey_reconnects_total` | counter | same |
+| `lock_acquire_ok_total` | counter | same |
+| `lock_acquire_busy_total` | counter | same |
+| `lock_unlock_ok_total` | counter | same |
+| `lock_unlock_mismatch_total` | counter | same |
 
 The `lock_*` counters aggregate distributed-lock traffic from `patterns.Mutex`
 across the component instance (per-lock breakdown is out of scope to keep
@@ -313,8 +313,8 @@ err := m.WithLock(ctx, func(ctx context.Context) error {
 `TryLock` / `Unlock` are also available. TTL is mandatory; token-based unlock
 (Lua) ensures you never delete another holder's lock. **Not Redlock** — see
 godoc for failure modes. Lock traffic is counted and exposed on `/metrics`
-(`caerus_lock_acquire_ok_total`, `caerus_lock_acquire_busy_total`,
-`caerus_lock_unlock_ok_total`, `caerus_lock_unlock_mismatch_total`), so
+(`lock_acquire_ok_total`, `lock_acquire_busy_total`,
+`lock_unlock_ok_total`, `lock_unlock_mismatch_total`), so
 contention and lost unlocks are observable without ad-hoc instrumentation.
 
 ### JSON helpers
