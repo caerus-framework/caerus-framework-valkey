@@ -15,7 +15,7 @@ replacement for valkey-go's command API. `Client()` remains first-class. For
 common patterns (distributed lock, JSON helpers, singleflight cache-aside),
 see the [`patterns`](#patterns) subpackage.
 
-Requires the `data` stage to be registered.
+Registers in the `data` initialization stage.
 
 ## Wiring
 
