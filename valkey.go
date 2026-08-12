@@ -49,28 +49,38 @@ type ValkeyConfig struct {
 	DialTimeoutSec      float64  `json:"dial_timeout_sec,omitempty" yaml:"dial_timeout_sec,omitempty" env:"DIAL_TIMEOUT_SEC"`
 	ConnWriteTimeoutSec float64  `json:"conn_write_timeout_sec,omitempty" yaml:"conn_write_timeout_sec,omitempty" env:"CONN_WRITE_TIMEOUT_SEC"`
 	ConnLifetimeSec     float64  `json:"conn_lifetime_sec,omitempty" yaml:"conn_lifetime_sec,omitempty" env:"CONN_LIFETIME_SEC"`
+	// DegradedMode — when true, a failed Init ping does not abort the process.
+	// The client is kept for later reconnect; metrics/logs scream. Default off
+	// (pointer so omitted ≠ explicit false). Off by default (hard Init).
+	DegradedMode *bool `json:"degraded_mode,omitempty" yaml:"degraded_mode,omitempty" env:"DEGRADED_MODE"`
+	// HealthWhenDegraded: "not_ready" (default) or "ready". Controls Health()
+	// (and thus /readyz) while the client cannot ping after a degraded Init
+	// or while disconnected. "ready" is break-glass: send LB traffic anyway.
+	HealthWhenDegraded string `json:"health_when_degraded,omitempty" yaml:"health_when_degraded,omitempty" env:"HEALTH_WHEN_DEGRADED"`
 }
 
 // Option configures the valkey component at construction time.
 type Option func(*options)
 
 type options struct {
-	clientOption valkey.ClientOption
-	loaded       *ValkeyConfig // set by WithConfig; overrides option-set defaults
-	configSource string        // named configuration source for live reload
-	configPath   string        // source file path (module self-registration)
-	srcEnvPrefix string        // source env overlay prefix (default: NAME_)
-	srcFormat    cf_configuration.Format
-	srcFormatSet bool
-	keyPrefix    string
-	logger       *slog.Logger
-	loggerSet    bool // true when WithLogger was called explicitly
-	pingTimeout  time.Duration
-	name         string // custom component name; empty means use ComponentName
-	tlsCAFile    string
-	tlsCertFile  string
-	tlsKeyFile   string
-	hooks        []CommandHook
+	clientOption       valkey.ClientOption
+	loaded             *ValkeyConfig // set by WithConfig; overrides option-set defaults
+	configSource       string        // named configuration source for live reload
+	configPath         string        // source file path (module self-registration)
+	srcEnvPrefix       string        // source env overlay prefix (default: NAME_)
+	srcFormat          cf_configuration.Format
+	srcFormatSet       bool
+	keyPrefix          string
+	logger             *slog.Logger
+	loggerSet          bool // true when WithLogger was called explicitly
+	pingTimeout        time.Duration
+	name               string // custom component name; empty means use ComponentName
+	tlsCAFile          string
+	tlsCertFile        string
+	tlsKeyFile         string
+	hooks              []CommandHook
+	degradedMode       bool
+	healthWhenDegraded string // "ready" | "not_ready"
 }
 
 // SourceOption configures the self-registered configuration source created by
@@ -244,6 +254,19 @@ func WithCommandHook(hooks ...CommandHook) Option {
 	return func(o *options) { o.hooks = append(o.hooks, hooks...) }
 }
 
+// WithDegradedMode allows Init to succeed when the connectivity ping fails.
+// Default is hard-fail. Degraded mode screams in logs/metrics; Health still
+// fails ping unless HealthWhenDegraded is "ready".
+func WithDegradedMode(enabled bool) Option {
+	return func(o *options) { o.degradedMode = enabled }
+}
+
+// WithHealthWhenDegraded sets Health() behaviour while unreachable after
+// DegradedMode: "not_ready" (default) or "ready" (break-glass LB traffic).
+func WithHealthWhenDegraded(policy string) Option {
+	return func(o *options) { o.healthWhenDegraded = policy }
+}
+
 // CFValkey is the caerus-framework-valkey component. It wraps a valkey-go
 // client, verifies connectivity at Init, and closes it at Shutdown.
 type CFValkey struct {
@@ -271,6 +294,15 @@ type CFValkey struct {
 	reconnects   atomic.Uint64
 	lockMeter    *LockMeter
 	hooks        []CommandHook
+
+	degradedMode       bool
+	healthWhenDegraded string // "ready" | "not_ready"
+	initDone           atomic.Bool
+	// liveConnected is true after a successful ping (Init or Health recovery).
+	liveConnected atomic.Bool
+	// degradedUnreachable: Init ping failed under DegradedMode (or later ping lost).
+	degradedUnreachable atomic.Bool
+	degradedModeUses    atomic.Uint64
 }
 
 // New creates a valkey component. The client is created and pinged at Init,
@@ -288,32 +320,56 @@ func New(opts ...Option) *CFValkey {
 	}
 	baseOpts := o.clientOption
 	basePrefix := o.keyPrefix
+	degrade := o.degradedMode
+	healthDegraded := normalizeHealthWhenDegraded(o.healthWhenDegraded)
 	if o.loaded != nil {
 		applyLoadedConfig(&o.clientOption, *o.loaded)
 		if o.loaded.KeyPrefix != "" {
 			o.keyPrefix = o.loaded.KeyPrefix
 		}
+		degrade, healthDegraded = degradedModeFromConfig(*o.loaded, degrade, healthDegraded)
 	}
 	return &CFValkey{
-		baseOpts:     baseOpts,
-		opts:         o.clientOption,
-		configSource: o.configSource,
-		configPath:   o.configPath,
-		srcEnvPrefix: o.srcEnvPrefix,
-		srcFormat:    o.srcFormat,
-		srcFormatSet: o.srcFormatSet,
-		logger:       o.logger,
-		loggerSet:    o.loggerSet,
-		pingTimeout:  o.pingTimeout,
-		basePrefix:   basePrefix,
-		keyPrefix:    o.keyPrefix,
-		name:         o.name,
-		tlsCAFile:    o.tlsCAFile,
-		tlsCertFile:  o.tlsCertFile,
-		tlsKeyFile:   o.tlsKeyFile,
-		lockMeter:    &LockMeter{},
-		hooks:        o.hooks,
+		baseOpts:           baseOpts,
+		opts:               o.clientOption,
+		configSource:       o.configSource,
+		configPath:         o.configPath,
+		srcEnvPrefix:       o.srcEnvPrefix,
+		srcFormat:          o.srcFormat,
+		srcFormatSet:       o.srcFormatSet,
+		logger:             o.logger,
+		loggerSet:          o.loggerSet,
+		pingTimeout:        o.pingTimeout,
+		basePrefix:         basePrefix,
+		keyPrefix:          o.keyPrefix,
+		name:               o.name,
+		tlsCAFile:          o.tlsCAFile,
+		tlsCertFile:        o.tlsCertFile,
+		tlsKeyFile:         o.tlsKeyFile,
+		lockMeter:          &LockMeter{},
+		hooks:              o.hooks,
+		degradedMode:       degrade,
+		healthWhenDegraded: healthDegraded,
 	}
+}
+
+func normalizeHealthWhenDegraded(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "ready":
+		return "ready"
+	default:
+		return "not_ready"
+	}
+}
+
+func degradedModeFromConfig(cfg ValkeyConfig, degrade bool, healthDegraded string) (bool, string) {
+	if cfg.DegradedMode != nil {
+		degrade = *cfg.DegradedMode
+	}
+	if cfg.HealthWhenDegraded != "" {
+		healthDegraded = normalizeHealthWhenDegraded(cfg.HealthWhenDegraded)
+	}
+	return degrade, healthDegraded
 }
 
 // applyLoadedConfig overlays non-zero fields of cfg onto the client option.
@@ -398,12 +454,14 @@ func buildTLSConfig(caFile, certFile, keyFile string) (*tls.Config, error) {
 }
 
 // Init implements cf.CaerusComponent. It creates the valkey-go client and
-// verifies connectivity with a ping, so a broken connection fails startup
-// (fail-fast) before any dependent component runs.
+// verifies connectivity with a ping. By default a broken connection fails
+// startup (fail-fast). With DegradedMode, a failed ping keeps the client and
+// lets Initialize continue (metrics/logs scream; Health stays honest unless
+// health_when_degraded=ready).
 func (c *CFValkey) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.client != nil {
+	if c.initDone.Load() {
 		return nil // already initialized
 	}
 	c.fw = fw
@@ -414,12 +472,14 @@ func (c *CFValkey) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 	}
 
 	if c.configSource != "" {
-		opts, prefix, err := c.clientOptsFromSource()
+		opts, prefix, degrade, healthDegraded, err := c.clientOptsFromSource()
 		if err != nil {
 			return err
 		}
 		c.opts = opts
 		c.keyPrefix = prefix
+		c.degradedMode = degrade
+		c.healthWhenDegraded = healthDegraded
 	}
 
 	if err := c.applyTLS(&c.opts); err != nil {
@@ -428,18 +488,47 @@ func (c *CFValkey) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 
 	client, err := valkey.NewClient(c.opts)
 	if err != nil {
-		return fmt.Errorf("cf_valkey: create client: %w", err)
+		if !c.degradedMode {
+			return fmt.Errorf("cf_valkey: create client: %w", err)
+		}
+		c.initDone.Store(true)
+		c.liveConnected.Store(false)
+		c.degradedUnreachable.Store(true)
+		c.degradedModeUses.Add(1)
+		c.pingFailures.Add(1)
+		c.logger.Error("cf_valkey: DegradedMode — create client failed; Init continues with nil client",
+			"err", err,
+			"addresses", c.opts.InitAddress,
+			"health_when_degraded", c.healthWhenDegraded,
+		)
+		return nil
 	}
 
 	pingCtx, cancel := context.WithTimeout(ctx, c.pingTimeout)
 	defer cancel()
 	if err := client.Do(pingCtx, client.B().Ping().Build()).Error(); err != nil {
-		client.Close()
 		c.pingFailures.Add(1)
-		return fmt.Errorf("cf_valkey: ping %v failed: %w", c.opts.InitAddress, err)
+		if !c.degradedMode {
+			client.Close()
+			return fmt.Errorf("cf_valkey: ping %v failed: %w", c.opts.InitAddress, err)
+		}
+		c.client = client
+		c.initDone.Store(true)
+		c.liveConnected.Store(false)
+		c.degradedUnreachable.Store(true)
+		c.degradedModeUses.Add(1)
+		c.logger.Error("cf_valkey: DegradedMode — ping failed; Init continues; Health/readyz follow health_when_degraded",
+			"err", err,
+			"addresses", c.opts.InitAddress,
+			"health_when_degraded", c.healthWhenDegraded,
+		)
+		return nil
 	}
 
 	c.client = client
+	c.initDone.Store(true)
+	c.liveConnected.Store(true)
+	c.degradedUnreachable.Store(false)
 	c.logger.Info("cf_valkey: connected",
 		"addresses", c.opts.InitAddress,
 		"db", c.opts.SelectDB,
@@ -468,14 +557,16 @@ func (c *CFValkey) applyTLS(opts *valkey.ClientOption) error {
 func (c *CFValkey) OnConfigReload(source string, cfg any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if source != c.configSource || c.client == nil || c.fw == nil {
+	if source != c.configSource || !c.initDone.Load() || c.fw == nil {
 		return
 	}
-	opts, prefix, err := c.clientOptsFromSource()
+	opts, prefix, degrade, healthDegraded, err := c.clientOptsFromSource()
 	if err != nil {
 		c.logger.Error("cf_valkey: config reload rejected", "err", err)
 		return
 	}
+	c.degradedMode = degrade
+	c.healthWhenDegraded = healthDegraded
 	if err := c.applyTLS(&opts); err != nil {
 		c.logger.Error("cf_valkey: config reload TLS rejected", "err", err)
 		return
@@ -497,22 +588,26 @@ func (c *CFValkey) OnConfigReload(source string, cfg any) {
 	c.client = newClient
 	c.opts = opts
 	c.keyPrefix = prefix
+	c.liveConnected.Store(true)
+	c.degradedUnreachable.Store(false)
 	c.reconnects.Add(1)
-	old.Close()
+	if old != nil {
+		old.Close()
+	}
 	c.logger.Info("cf_valkey: reconnected after config reload",
 		"addresses", opts.InitAddress,
 		"db", opts.SelectDB,
 	)
 }
 
-func (c *CFValkey) clientOptsFromSource() (valkey.ClientOption, string, error) {
+func (c *CFValkey) clientOptsFromSource() (valkey.ClientOption, string, bool, string, error) {
 	conf, ok := cf.Get[*cf_configuration.Configuration](c.fw)
 	if !ok {
-		return valkey.ClientOption{}, "", errors.New("cf_valkey: configuration component not registered")
+		return valkey.ClientOption{}, "", false, "", errors.New("cf_valkey: configuration component not registered")
 	}
 	loaded, ok := cf_configuration.Get[ValkeyConfig](conf, c.configSource)
 	if !ok {
-		return valkey.ClientOption{}, "", fmt.Errorf("cf_valkey: configuration source %q not found", c.configSource)
+		return valkey.ClientOption{}, "", false, "", fmt.Errorf("cf_valkey: configuration source %q not found", c.configSource)
 	}
 	opts := c.baseOpts
 	applyLoadedConfig(&opts, *loaded)
@@ -529,7 +624,8 @@ func (c *CFValkey) clientOptsFromSource() (valkey.ClientOption, string, error) {
 	if loaded.TLSKeyFile != "" {
 		c.tlsKeyFile = loaded.TLSKeyFile
 	}
-	return opts, prefix, nil
+	degrade, healthDegraded := degradedModeFromConfig(*loaded, c.degradedMode, c.healthWhenDegraded)
+	return opts, prefix, degrade, healthDegraded, nil
 }
 
 // RegisterConfigSources implements cf.ConfigSourceRegistrar. The framework
@@ -576,6 +672,9 @@ func (c *CFValkey) Shutdown(ctx context.Context) error {
 		c.logsSub.Unsubscribe()
 		c.logsSub = nil
 	}
+	c.initDone.Store(false)
+	c.liveConnected.Store(false)
+	c.degradedUnreachable.Store(false)
 	if c.client == nil {
 		return nil
 	}
@@ -682,50 +781,100 @@ func (c *CFValkey) KeyPrefix() string {
 
 // Health implements cf.HealthProvider. It pings the valkey server, so the
 // observability component's readiness endpoint reflects real connectivity. A
-// nil client (before Init or after Shutdown) is unhealthy.
+// nil client (before Init or after Shutdown) is unhealthy. After DegradedMode
+// with a failed ping, behaviour follows health_when_degraded (default
+// not_ready → still unhealthy for /readyz).
 func (c *CFValkey) Health(ctx context.Context) error {
 	client := c.Client()
 	if client == nil {
+		if c.initDone.Load() && c.degradedMode && c.healthWhenDegraded == "ready" {
+			return nil
+		}
 		return errors.New("cf_valkey: client is not initialized")
 	}
-	return client.Do(ctx, client.B().Ping().Build()).Error()
+	if err := client.Do(ctx, client.B().Ping().Build()).Error(); err != nil {
+		c.pingFailures.Add(1)
+		c.liveConnected.Store(false)
+		c.degradedUnreachable.Store(true)
+		if c.degradedMode && c.healthWhenDegraded == "ready" {
+			return nil
+		}
+		return err
+	}
+	c.liveConnected.Store(true)
+	c.degradedUnreachable.Store(false)
+	return nil
 }
 
-// Metrics implements cf_observability.MetricsProvider. It reports the connected
-// valkey client's state; before Init or after Shutdown it returns nil, so the
-// observability component skips it (lazy pickup).
+// Metrics implements cf_observability.MetricsProvider. Before Init or after
+// Shutdown it returns nil. After Init (including DegradedMode without a live
+// ping) it always returns samples so degrade/unreachable state is visible.
 func (c *CFValkey) Metrics() []cf_observability.Metric {
-	if c.Client() == nil {
+	if !c.initDone.Load() {
 		return nil
+	}
+	live := 0.0
+	if c.liveConnected.Load() {
+		live = 1
+	}
+	degraded := 0.0
+	if c.degradedUnreachable.Load() {
+		degraded = 1
 	}
 	labels := map[string]string{
 		"addresses": strings.Join(c.opts.InitAddress, ","),
 		"db":        strconv.Itoa(c.opts.SelectDB),
 		"component": c.Name(),
 	}
-	metrics := []cf_observability.Metric{{
-		Name:   "valkey_info",
-		Help:   "Valkey client state.",
-		Value:  1,
-		Labels: copyLabels(labels),
-	}}
-	metrics = append(metrics,
-		cf_observability.Metric{
+	infoLabels := copyLabels(labels)
+	infoLabels["live"] = strconv.FormatBool(c.liveConnected.Load())
+	degradedLabels := copyLabels(labels)
+	degradedLabels["degraded_mode"] = strconv.FormatBool(c.degradedMode)
+	degradedLabels["health_when_degraded"] = c.healthWhenDegraded
+	metrics := []cf_observability.Metric{
+		{
+			Name:   "valkey_info",
+			Help:   "Valkey client descriptor; 1 while Init completed.",
+			Value:  1,
+			Labels: infoLabels,
+		},
+		{
+			Name:   "valkey_live_connected",
+			Help:   "1 when the last successful ping succeeded.",
+			Value:  live,
+			Labels: copyLabels(labels),
+		},
+		{
+			Name:   "valkey_degraded_unreachable",
+			Help:   "1 when running without a successful ping (DegradedMode path or lost connectivity).",
+			Value:  degraded,
+			Labels: degradedLabels,
+		},
+		{
+			Name:   "valkey_degraded_mode_uses_total",
+			Help:   "Times Init continued after a failed ping because DegradedMode was enabled.",
+			Value:  float64(c.degradedModeUses.Load()),
+			Labels: copyLabels(labels),
+			Type:   cf_observability.MetricTypeCounter,
+		},
+		{
 			Name:   "valkey_ping_failures_total",
 			Help:   "Total number of failed connectivity pings.",
 			Value:  float64(c.pingFailures.Load()),
 			Labels: copyLabels(labels),
 			Type:   cf_observability.MetricTypeCounter,
 		},
-		cf_observability.Metric{
+		{
 			Name:   "valkey_reconnects_total",
 			Help:   "Total number of successful reconnects after config reload.",
 			Value:  float64(c.reconnects.Load()),
 			Labels: copyLabels(labels),
 			Type:   cf_observability.MetricTypeCounter,
 		},
-	)
-	metrics = append(metrics, c.lockMeter.Metrics(labels)...)
+	}
+	if c.Client() != nil {
+		metrics = append(metrics, c.lockMeter.Metrics(labels)...)
+	}
 	return metrics
 }
 
