@@ -115,6 +115,8 @@ returns the configured prefix, and `Key()` is safe to call before `Init`
 | `WithClientName(name)` | `CLIENT SETNAME` on connections |
 | `WithKeyPrefix(prefix)` | scope all keys (see above); trailing `:` trimmed |
 | `WithPingTimeout(d)` | Init connectivity-ping timeout (default `5s`) |
+| `WithDegradedMode(bool)` | when true, Init may succeed without a live ping (default **off** / hard-fail) |
+| `WithHealthWhenDegraded("not_ready"\|"ready")` | `/readyz` while degraded: default `not_ready`; `ready` is break-glass LB traffic |
 | `WithName(name)` | custom component name for multiple instances (default `"valkey"`) |
 | `WithLogger(*slog.Logger)` | explicit logger override; defaults to the framework `logs` component's logger (re-delivered on `logs` `Reconfigure`), falling back to `slog.Default()` |
 | `WithTLS(caFile, certFile, keyFile)` | TLS from PEM file paths (Kubernetes-mounted secrets); CA for server verification, cert+key for mTLS |
@@ -203,18 +205,44 @@ Helpers: `ParseURL` / `OverlayURL` for `redis://`, `valkey://`, or `host:port`.
 failure keeps the previous client. In Kubernetes prefer file-mounted secrets
 for rotation; use env/URL for local and CI.
 
-## Fail-fast behaviour
+## Fail-fast behaviour (default)
 
 `Init` creates the client and pings the server. If the connection is refused or
 the ping times out, `Init` returns an error and startup aborts before any
 dependent component runs. `Client()` returns `nil` before `Init` or after
 `Shutdown`.
 
+## DegradedMode (optional break-glass)
+
+**Not automatic.** Default remains hard Init. Set `degraded_mode: true` (or
+`WithDegradedMode(true)`) when the process must finish Initialize even if
+Valkey is unreachable (e.g. a rate limiter that can run on sticky notes with
+`force_memory`).
+
+```json
+{
+  "addr": "valkey:6379",
+  "degraded_mode": true,
+  "health_when_degraded": "not_ready"
+}
+```
+
+| Setting | Meaning |
+|---|---|
+| `degraded_mode` | Init may succeed without a successful ping; logs/metrics scream (`degraded_unreachable`, `degraded_mode_uses_total`). **Default off.** |
+| `health_when_degraded: "not_ready"` | Default — `Health` still fails → `/readyz` 503 while disconnected. |
+| `health_when_degraded: "ready"` | Break-glass — `Health` returns nil while down so LB may send traffic. Prefer a **dedicated** Valkey instance when the same pod also has a hard session/DB dependency. |
+
+DegradedMode answers “may Initialize finish?” — it does **not** mean the store
+is healthy. Hot reload of the valkey source can reconnect later when the file
+updates; env alone does not wake a running process.
+
 ## Observability
 
 `CFValkey` implements `cf.HealthProvider`: `Health(ctx)` pings the server, so
 the `observability` component's `/readyz` endpoint reflects real connectivity.
-Before `Init` or after `Shutdown` (nil client) it reports unhealthy.
+Before `Init` or after `Shutdown` (nil client) it reports unhealthy. After
+DegradedMode without a live ping, behaviour follows `health_when_degraded`.
 
 It also implements `cf_observability.MetricsProvider`: while connected it
 contributes samples to `/metrics`:
@@ -222,6 +250,8 @@ contributes samples to `/metrics`:
 | Sample | Type | Labels |
 |---|---|---|
 | `valkey_info` | gauge | `addresses`, `db`, `component` |
+| `valkey_degraded_unreachable` | gauge | `degraded_mode`, `health_when_degraded`, … |
+| `valkey_degraded_mode_uses_total` | counter | same |
 | `valkey_ping_failures_total` | counter | same |
 | `valkey_reconnects_total` | counter | same |
 | `valkey_lock_acquire_ok_total` | counter | same |

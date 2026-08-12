@@ -179,6 +179,45 @@ func TestInitRejectsUnknownServer(t *testing.T) {
 	}
 }
 
+func TestDegradedModeAllowsFailedPing(t *testing.T) {
+	v := New(
+		WithAddress("127.0.0.1:1"),
+		WithPingTimeout(200*time.Millisecond),
+		WithDegradedMode(true),
+		WithHealthWhenDegraded("not_ready"),
+	)
+	fw := newFramework(t)
+	if err := v.Init(context.Background(), fw); err != nil {
+		t.Fatalf("DegradedMode should allow Init after ping fail: %v", err)
+	}
+	// Client may be nil if NewClient dials at construct time and fails.
+	if err := v.Health(context.Background()); err == nil {
+		t.Fatal("Health should fail when not_ready and unreachable")
+	}
+	ms := v.Metrics()
+	if ms == nil {
+		t.Fatal("Metrics should scream after DegradedMode")
+	}
+	_ = v.Shutdown(context.Background())
+}
+
+func TestDegradedModeHealthWhenReady(t *testing.T) {
+	v := New(
+		WithAddress("127.0.0.1:1"),
+		WithPingTimeout(200*time.Millisecond),
+		WithDegradedMode(true),
+		WithHealthWhenDegraded("ready"),
+	)
+	fw := newFramework(t)
+	if err := v.Init(context.Background(), fw); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := v.Health(context.Background()); err != nil {
+		t.Fatalf("health_when_degraded=ready should make Health nil while down: %v", err)
+	}
+	_ = v.Shutdown(context.Background())
+}
+
 func TestInitUsesFrameworkLogger(t *testing.T) {
 	logs := cf_logs.New(cf_logs.WithWriter(io.Discard))
 	fw := cf.New()
