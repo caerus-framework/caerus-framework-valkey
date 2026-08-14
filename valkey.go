@@ -39,7 +39,7 @@ const (
 type ValkeyConfig struct {
 	Addresses           []string `json:"addresses" yaml:"addresses" env:"ADDRESSES"`
 	Username            string   `json:"username,omitempty" yaml:"username,omitempty" env:"USERNAME"`
-	Password            string   `json:"password,omitempty" yaml:"password,omitempty" env:"PASSWORD"`
+	Password            string   `json:"password,omitempty" yaml:"password,omitempty" env:"PASSWORD" secret:"redact"`
 	DB                  int      `json:"db" yaml:"db" env:"DB"`
 	ClientName          string   `json:"client_name,omitempty" yaml:"client_name,omitempty" env:"CLIENT_NAME"`
 	KeyPrefix           string   `json:"key_prefix,omitempty" yaml:"key_prefix,omitempty" env:"KEY_PREFIX"`
@@ -533,6 +533,7 @@ func (c *CFValkey) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 		"addresses", c.opts.InitAddress,
 		"db", c.opts.SelectDB,
 		"client_name", c.opts.ClientName,
+		cf_logs.SecretSet("password", c.opts.Password),
 	)
 	return nil
 }
@@ -597,6 +598,7 @@ func (c *CFValkey) OnConfigReload(source string, cfg any) {
 	c.logger.Info("cf_valkey: reconnected after config reload",
 		"addresses", opts.InitAddress,
 		"db", opts.SelectDB,
+		cf_logs.SecretSet("password", opts.Password),
 	)
 }
 

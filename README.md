@@ -200,6 +200,8 @@ valkey := cf_valkey.New(
 ```
 
 Helpers: `ParseURL` / `OverlayURL` for `redis://`, `valkey://`, or `host:port`.
+`ParseURL` errors never include the raw URL (userinfo). `Password` is tagged
+`secret:"redact"`; connect/reload logs use `password_set` only.
 `WithConfigSource` implements `ConfigReloader`: on file reload (or
 `cfg.Reload`), builds a new client, pings, swaps, closes the old client; on
 failure keeps the previous client. In Kubernetes prefer file-mounted secrets
