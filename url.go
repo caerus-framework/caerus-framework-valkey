@@ -1,6 +1,7 @@
 package cf_valkey
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -24,7 +25,8 @@ func ParseURL(raw string) (ValkeyConfig, error) {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return zero, fmt.Errorf("cf_valkey: parse URL: %w", err)
+		// url.Error.Error interpolates the raw URL (password in userinfo).
+		return zero, errors.New("cf_valkey: parse URL: invalid URL")
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "redis", "rediss", "valkey", "valkeys":
