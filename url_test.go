@@ -54,6 +54,9 @@ func TestValkeyConfigLogArgsNeverCleartext(t *testing.T) {
 	if !strings.Contains(out, "[redacted]") {
 		t.Fatalf("want [redacted] in %s", out)
 	}
+	if !strings.Contains(out, "10.0.0.1:6379") {
+		t.Fatalf("address should stay visible: %s", out)
+	}
 }
 
 func TestOverlayURL(t *testing.T) {
