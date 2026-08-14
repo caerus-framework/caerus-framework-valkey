@@ -3,10 +3,10 @@ module github.com/caerus-framework/caerus-framework-valkey
 go 1.26
 
 require (
-	github.com/caerus-framework/caerus-framework v0.0.8
+	github.com/caerus-framework/caerus-framework v0.0.9
 	github.com/caerus-framework/caerus-framework-configuration v0.0.7
-	github.com/caerus-framework/caerus-framework-logs v0.0.5
-	github.com/caerus-framework/caerus-framework-observability v0.0.4
+	github.com/caerus-framework/caerus-framework-logs v0.0.7
+	github.com/caerus-framework/caerus-framework-observability v0.0.5
 	github.com/valkey-io/valkey-go v1.0.76
 	golang.org/x/sync v0.22.0
 )
@@ -34,7 +34,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.45.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
 	golang.org/x/mod v0.39.0 // indirect
-	golang.org/x/net v0.57.0 // indirect
+	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/tools v0.48.0 // indirect
@@ -48,5 +48,7 @@ require (
 tool github.com/caerus-framework/caerus-framework/cmd/caerusvet
 
 replace github.com/caerus-framework/caerus-framework => ../caerus-framework
+
 replace github.com/caerus-framework/caerus-framework-logs => ../caerus-framework-logs
+
 replace github.com/caerus-framework/caerus-framework-configuration => ../caerus-framework-configuration
