@@ -13,7 +13,9 @@ health, reload, key prefix, named instances, TLS, timeouts, and metrics.
 **Not a Redis ORM.** There are no struct tags, no HASH repositories, and no
 replacement for valkey-go's command API. `Client()` remains first-class. For
 common patterns (distributed lock, JSON helpers, singleflight cache-aside),
-see the [`patterns`](#patterns) subpackage.
+see the [`patterns`](#patterns) subpackage. Rate-limit Lua (and the sticky-note
+counter map) live on **`caerus-framework-valkey-state`**; HTTP 429 / middleware
+live on **`caerus-framework-http-ratelimiter`**.
 
 Registers in the `data` initialization stage.
 
