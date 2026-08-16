@@ -21,49 +21,61 @@ Registers in the `data` initialization stage.
 
 ## Wiring
 
+Two wiring shapes. Prefer the **app-owned** shape.
+
+### App-owned consumer (golden — demoapp pattern)
+
+`main` declares valkey as chassis. The app holds `*CFValkey` and calls
+`Client()` / `Key()` **per use** (never copy the client at Init).
+
 ```go
-package main
+fw := cf.New(&cf.FrameworkOptions{
+	Logs:          &cf.LogsSettings{Format: "json", Level: "info", ConfigSource: "logs"},
+	Observability: &cf.ObservabilitySettings{Address: ":9090", ConfigSource: "observability"},
+	Components: []cf.CaerusComponent{
+		cf_valkey.New(cf_valkey.WithConfigSource("valkey", "config/valkey.json")),
+		app.New(),
+	},
+})
+```
 
-import (
-	"context"
-	"log/slog"
-	"os"
+```go
+type App struct {
+	vk *cf_valkey.CFValkey
+}
 
-	cf "github.com/caerus-framework/caerus-framework"
-	cf_logs "github.com/caerus-framework/caerus-framework-logs"
-	cf_valkey "github.com/caerus-framework/caerus-framework-valkey"
-)
+func (a *App) GetDependencies() []string {
+	return []string{cf_valkey.ComponentName}
+}
 
-func main() {
-	fw := cf.New()
-
-	logs := cf_logs.New(cf_logs.WithWriter(os.Stdout))
-	if err := fw.AddComponent(logs); err != nil { // "logs" is a required dependency
-		slog.Error("register logs", "err", err)
-		os.Exit(1)
+func (a *App) Init(ctx context.Context, fw *cf.CaerusFramework) error {
+	vk, ok := cf.Get[*cf_valkey.CFValkey](fw)
+	if !ok {
+		return errors.New("app: valkey missing")
 	}
+	a.vk = vk
+	return nil
+}
 
-	valkey := cf_valkey.New(
-		cf_valkey.WithAddress("127.0.0.1:6379"),
-		cf_valkey.WithDB(0),
-		cf_valkey.WithClientName("my-service"),
-	)
-	app := NewMyApp(valkey) // any component with GetDependencies() -> []string{cf_valkey.ComponentName}
-	if err := fw.AddComponent(valkey); err != nil {
-		slog.Error("register valkey", "err", err)
-		os.Exit(1)
-	}
-	if err := fw.AddComponent(app); err != nil {
-		slog.Error("register app", "err", err)
-		os.Exit(1)
-	}
-
-	if err := fw.Run(context.Background()); err != nil {
-		slog.Error("startup failed", "err", err)
-		os.Exit(1)
-	}
+func (a *App) set(ctx context.Context, k, v string) error {
+	cl := a.vk.Client() // live client after reconnect / reload
+	return cl.Do(ctx, cl.B().Set().Key(a.vk.Key(k)).Value(v).Build()).Error()
 }
 ```
+
+Wrong: `a.client = vk.Client()` once at Init (dead after reload).
+Right: store `*CFValkey`; `Client()` per command.
+
+### Simple `main`-level wiring
+
+```go
+fw := cf.New()
+fw.AddComponent(cf_logs.New(cf_logs.WithWriter(os.Stdout)))
+fw.AddComponent(cf_valkey.New(cf_valkey.WithAddress("127.0.0.1:6379")))
+```
+
+Then `cf.MustGet[*cf_valkey.CFValkey](fw)` in that binary. Still call
+`Client()` per use, not a snapshot.
 
 ## Usage
 
@@ -122,6 +134,7 @@ returns the configured prefix, and `Key()` is safe to call before `Init`
 | `WithName(name)` | custom component name for multiple instances (default `"valkey"`) |
 | `WithLogger(*slog.Logger)` | explicit logger override; defaults to the framework `logs` component's logger (re-delivered on `logs` `Reconfigure`), falling back to `slog.Default()` |
 | `WithTLS(caFile, certFile, keyFile)` | TLS from PEM file paths (Kubernetes-mounted secrets); CA for server verification, cert+key for mTLS |
+| `WithTLSInsecureSkipVerify(true)` | skip cert verify (lab only; not implied by `rediss://`) |
 | `WithDialTimeout(d)` | TCP dial timeout |
 | `WithConnWriteTimeout(d)` | per-connection read/write timeout; bounds pipeline waits and triggers periodic PINGs |
 | `WithConnLifetime(d)` | maximum connection lifetime; zero means no limit |
@@ -379,7 +392,24 @@ compose with `Mutex` for cross-pod coalescing.
 
 ## TLS
 
-Configure TLS from PEM file paths (suitable for Kubernetes-mounted secrets):
+Two different things:
+
+| | What it means |
+|---|---|
+| **URL scheme** `rediss://` / `valkeys://` | This URL **wants TLS**. The client gets `TLSConfig` (MinVersion 1.2, system roots) even with **no** PEM files. `redis://` / `valkey://` do not enable TLS by themselves. |
+| **PEM files** | Custom CA and/or mTLS. Files win for trust material. Re-read on reload / reconnect. |
+
+Client cert and key are a **pair** (same rule as postgresql): both set, both
+empty, or the overlay is rejected and last-good stays. Do not set only
+`tls_cert_file` or only `tls_key_file` (env or JSON). CA (`tls_ca_file`)
+rotates on its own.
+
+Kubernetes layout (cert-manager / `kubernetes.io/tls`): mount `ca.crt`,
+`tls.crt`, and `tls.key`; point the three settings at those paths. A Secret
+update that replaces the files is picked up on the next reload.
+
+`tls_insecure_skip_verify` is a **named switch** for broken lab certs. It is
+**not** implied by `rediss://`.
 
 ```go
 vk := cf_valkey.New(
@@ -388,8 +418,11 @@ vk := cf_valkey.New(
 )
 ```
 
-Or via `ValkeyConfig` fields `tls_ca_file`, `tls_cert_file`, `tls_key_file`
-(drivable by env: `TLS_CA_FILE`, `TLS_CERT_FILE`, `TLS_KEY_FILE`).
+Or `tls: true` in JSON, or `VALKEY_URL=rediss://host:6379`.
+
+With `degraded_mode`, a failed Init ping does not abort. A background loop
+retries ping/rebuild (backoff + jitter) until the server is up or Shutdown.
+`Health` stays honest unless `health_when_degraded` is `ready`.
 
 ## Tests
 

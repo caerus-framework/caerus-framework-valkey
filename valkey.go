@@ -37,18 +37,25 @@ const (
 // through the configuration component (caerus-framework-configuration) and
 // pass it via WithConfig; both JSON and YAML tags are provided.
 type ValkeyConfig struct {
-	Addresses           []string `json:"addresses" yaml:"addresses" env:"ADDRESSES"`
-	Username            string   `json:"username,omitempty" yaml:"username,omitempty" env:"USERNAME"`
-	Password            string   `json:"password,omitempty" yaml:"password,omitempty" env:"PASSWORD" secret:"redact"`
-	DB                  int      `json:"db" yaml:"db" env:"DB"`
-	ClientName          string   `json:"client_name,omitempty" yaml:"client_name,omitempty" env:"CLIENT_NAME"`
-	KeyPrefix           string   `json:"key_prefix,omitempty" yaml:"key_prefix,omitempty" env:"KEY_PREFIX"`
-	TLSCAFile           string   `json:"tls_ca_file,omitempty" yaml:"tls_ca_file,omitempty" env:"TLS_CA_FILE"`
-	TLSCertFile         string   `json:"tls_cert_file,omitempty" yaml:"tls_cert_file,omitempty" env:"TLS_CERT_FILE"`
-	TLSKeyFile          string   `json:"tls_key_file,omitempty" yaml:"tls_key_file,omitempty" env:"TLS_KEY_FILE"`
-	DialTimeoutSec      float64  `json:"dial_timeout_sec,omitempty" yaml:"dial_timeout_sec,omitempty" env:"DIAL_TIMEOUT_SEC"`
-	ConnWriteTimeoutSec float64  `json:"conn_write_timeout_sec,omitempty" yaml:"conn_write_timeout_sec,omitempty" env:"CONN_WRITE_TIMEOUT_SEC"`
-	ConnLifetimeSec     float64  `json:"conn_lifetime_sec,omitempty" yaml:"conn_lifetime_sec,omitempty" env:"CONN_LIFETIME_SEC"`
+	Addresses   []string `json:"addresses" yaml:"addresses" env:"ADDRESSES"`
+	Username    string   `json:"username,omitempty" yaml:"username,omitempty" env:"USERNAME"`
+	Password    string   `json:"password,omitempty" yaml:"password,omitempty" env:"PASSWORD" secret:"redact"`
+	DB          int      `json:"db" yaml:"db" env:"DB"`
+	ClientName  string   `json:"client_name,omitempty" yaml:"client_name,omitempty" env:"CLIENT_NAME"`
+	KeyPrefix   string   `json:"key_prefix,omitempty" yaml:"key_prefix,omitempty" env:"KEY_PREFIX"`
+	TLSCAFile   string   `json:"tls_ca_file,omitempty" yaml:"tls_ca_file,omitempty" env:"TLS_CA_FILE"`
+	TLSCertFile string   `json:"tls_cert_file,omitempty" yaml:"tls_cert_file,omitempty" env:"TLS_CERT_FILE"`
+	TLSKeyFile  string   `json:"tls_key_file,omitempty" yaml:"tls_key_file,omitempty" env:"TLS_KEY_FILE"`
+	// TLS enables TLS with system roots (MinVersion 1.2) when no PEM files
+	// are set. ParseURL/OverlayURL set this for rediss:// and valkeys://.
+	// PEM files still win for custom CA / mTLS.
+	TLS *bool `json:"tls,omitempty" yaml:"tls,omitempty" env:"TLS"`
+	// TLSInsecureSkipVerify skips certificate verify. Lab/broken certs only;
+	// never the default. Explicit setting, not implied by rediss://.
+	TLSInsecureSkipVerify *bool   `json:"tls_insecure_skip_verify,omitempty" yaml:"tls_insecure_skip_verify,omitempty" env:"TLS_INSECURE_SKIP_VERIFY"`
+	DialTimeoutSec        float64 `json:"dial_timeout_sec,omitempty" yaml:"dial_timeout_sec,omitempty" env:"DIAL_TIMEOUT_SEC"`
+	ConnWriteTimeoutSec   float64 `json:"conn_write_timeout_sec,omitempty" yaml:"conn_write_timeout_sec,omitempty" env:"CONN_WRITE_TIMEOUT_SEC"`
+	ConnLifetimeSec       float64 `json:"conn_lifetime_sec,omitempty" yaml:"conn_lifetime_sec,omitempty" env:"CONN_LIFETIME_SEC"`
 	// DegradedMode — when true, a failed Init ping does not abort the process.
 	// The client is kept for later reconnect; metrics/logs scream. Default off
 	// (pointer so omitted ≠ explicit false). Off by default (hard Init).
@@ -78,6 +85,8 @@ type options struct {
 	tlsCAFile          string
 	tlsCertFile        string
 	tlsKeyFile         string
+	tlsWanted          bool
+	tlsInsecure        bool
 	hooks              []CommandHook
 	degradedMode       bool
 	healthWhenDegraded string // "ready" | "not_ready"
@@ -216,14 +225,21 @@ func WithName(name string) Option {
 }
 
 // WithTLS configures TLS from PEM file paths. Suitable for Kubernetes-mounted
-// secrets (External Secrets). All three files are optional; set at least
-// TLSCAFile for server verification, or CertFile+KeyFile for mTLS.
+// secrets (External Secrets). CA is optional (server verify / private CA).
+// Client cert and key are a pair: both set for mTLS, or both empty. A half
+// pair is rejected at apply / reload (last-good), same as postgresql.
 func WithTLS(tlsCAFile, tlsCertFile, tlsKeyFile string) Option {
 	return func(o *options) {
 		o.tlsCAFile = tlsCAFile
 		o.tlsCertFile = tlsCertFile
 		o.tlsKeyFile = tlsKeyFile
 	}
+}
+
+// WithTLSInsecureSkipVerify skips server certificate verification. Use only
+// for broken lab certs; rediss:// does not turn this on by itself.
+func WithTLSInsecureSkipVerify(skip bool) Option {
+	return func(o *options) { o.tlsInsecure = skip }
 }
 
 // WithDialTimeout sets the TCP dial timeout (default: valkey-go's default,
@@ -290,19 +306,22 @@ type CFValkey struct {
 	tlsCAFile    string
 	tlsCertFile  string
 	tlsKeyFile   string
+	tlsWanted    bool
+	tlsInsecure  bool
 	pingFailures atomic.Uint64
 	reconnects   atomic.Uint64
 	lockMeter    *LockMeter
 	hooks        []CommandHook
 
-	degradedMode       bool
-	healthWhenDegraded string // "ready" | "not_ready"
-	initDone           atomic.Bool
-	// liveConnected is true after a successful ping (Init or Health recovery).
-	liveConnected atomic.Bool
-	// degradedUnreachable: Init ping failed under DegradedMode (or later ping lost).
+	degradedMode        bool
+	healthWhenDegraded  string // "ready" | "not_ready"
+	initDone            atomic.Bool
+	liveConnected       atomic.Bool
 	degradedUnreachable atomic.Bool
 	degradedModeUses    atomic.Uint64
+
+	reconnectCancel context.CancelFunc
+	reconnectWG     sync.WaitGroup
 }
 
 // New creates a valkey component. The client is created and pinged at Init,
@@ -329,7 +348,7 @@ func New(opts ...Option) *CFValkey {
 		}
 		degrade, healthDegraded = degradedModeFromConfig(*o.loaded, degrade, healthDegraded)
 	}
-	return &CFValkey{
+	c := &CFValkey{
 		baseOpts:           baseOpts,
 		opts:               o.clientOption,
 		configSource:       o.configSource,
@@ -346,11 +365,16 @@ func New(opts ...Option) *CFValkey {
 		tlsCAFile:          o.tlsCAFile,
 		tlsCertFile:        o.tlsCertFile,
 		tlsKeyFile:         o.tlsKeyFile,
+		tlsInsecure:        o.tlsInsecure,
 		lockMeter:          &LockMeter{},
 		hooks:              o.hooks,
 		degradedMode:       degrade,
 		healthWhenDegraded: healthDegraded,
 	}
+	if o.loaded != nil {
+		_ = c.applyTLSSettings(*o.loaded)
+	}
+	return c
 }
 
 func normalizeHealthWhenDegraded(policy string) string {
@@ -431,6 +455,9 @@ func buildTLSConfig(caFile, certFile, keyFile string) (*tls.Config, error) {
 	if caFile == "" && certFile == "" && keyFile == "" {
 		return nil, nil
 	}
+	if (certFile == "") != (keyFile == "") {
+		return nil, fmt.Errorf("cf_valkey: TLS client cert and key must be set together")
+	}
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
 	if caFile != "" {
 		caPEM, err := os.ReadFile(caFile)
@@ -443,7 +470,7 @@ func buildTLSConfig(caFile, certFile, keyFile string) (*tls.Config, error) {
 		}
 		tlsCfg.RootCAs = pool
 	}
-	if certFile != "" && keyFile != "" {
+	if certFile != "" {
 		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
 			return nil, fmt.Errorf("cf_valkey: load TLS client keypair: %w", err)
@@ -501,6 +528,7 @@ func (c *CFValkey) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 			"addresses", c.opts.InitAddress,
 			"health_when_degraded", c.healthWhenDegraded,
 		)
+		c.startReconnectLocked()
 		return nil
 	}
 
@@ -522,6 +550,7 @@ func (c *CFValkey) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 			"addresses", c.opts.InitAddress,
 			"health_when_degraded", c.healthWhenDegraded,
 		)
+		c.startReconnectLocked()
 		return nil
 	}
 
@@ -535,19 +564,69 @@ func (c *CFValkey) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 		"client_name", c.opts.ClientName,
 		cf_logs.SecretSet("password", c.opts.Password),
 	)
+	if c.degradedMode {
+		c.startReconnectLocked()
+	}
 	return nil
 }
 
-// applyTLS builds and attaches a TLS config to opts from the component's TLS
-// file paths. No-op when no TLS files are configured.
+// mergeTLSFilePaths overlays incoming config paths onto the current CA and
+// client pair. Same rule as cf_postgres applyTLSFiles: cert and key are a
+// unit — both set replaces the pair, both empty keeps the current pair,
+// exactly one set is an error and the current paths are unchanged. CA is
+// independent (non-empty replaces).
+func mergeTLSFilePaths(ca, cert, key string, cfg ValkeyConfig) (string, string, string, error) {
+	if (cfg.TLSCertFile == "") != (cfg.TLSKeyFile == "") {
+		return ca, cert, key, fmt.Errorf("cf_valkey: TLS client cert and key must be set together")
+	}
+	if cfg.TLSCAFile != "" {
+		ca = cfg.TLSCAFile
+	}
+	if cfg.TLSCertFile != "" {
+		cert = cfg.TLSCertFile
+		key = cfg.TLSKeyFile
+	}
+	return ca, cert, key, nil
+}
+
+// applyTLSSettings copies TLS switches and file paths from cfg. File paths
+// use mergeTLSFilePaths so a half overlay cannot glue a new cert onto an
+// old key. Returns an error on a half pair; the component paths are unchanged.
+func (c *CFValkey) applyTLSSettings(cfg ValkeyConfig) error {
+	ca, cert, key, err := mergeTLSFilePaths(c.tlsCAFile, c.tlsCertFile, c.tlsKeyFile, cfg)
+	if err != nil {
+		return err
+	}
+	c.tlsCAFile = ca
+	c.tlsCertFile = cert
+	c.tlsKeyFile = key
+	if cfg.TLS != nil {
+		c.tlsWanted = *cfg.TLS
+	}
+	if cfg.TLSInsecureSkipVerify != nil {
+		c.tlsInsecure = *cfg.TLSInsecureSkipVerify
+	}
+	return nil
+}
+
+// applyTLS attaches TLS to opts. PEM files build a custom pool / mTLS.
+// rediss:// / valkeys:// / tls:true enable TLS with system roots when no
+// files are set. tls_insecure_skip_verify is never implied by the scheme.
 func (c *CFValkey) applyTLS(opts *valkey.ClientOption) error {
 	tlsCfg, err := buildTLSConfig(c.tlsCAFile, c.tlsCertFile, c.tlsKeyFile)
 	if err != nil {
 		return err
 	}
-	if tlsCfg != nil {
-		opts.TLSConfig = tlsCfg
+	if tlsCfg == nil && c.tlsWanted {
+		tlsCfg = &tls.Config{MinVersion: tls.VersionTLS12}
 	}
+	if tlsCfg == nil {
+		return nil
+	}
+	if c.tlsInsecure {
+		tlsCfg.InsecureSkipVerify = true
+	}
+	opts.TLSConfig = tlsCfg
 	return nil
 }
 
@@ -617,14 +696,8 @@ func (c *CFValkey) clientOptsFromSource() (valkey.ClientOption, string, bool, st
 	if loaded.KeyPrefix != "" {
 		prefix = loaded.KeyPrefix
 	}
-	if loaded.TLSCAFile != "" {
-		c.tlsCAFile = loaded.TLSCAFile
-	}
-	if loaded.TLSCertFile != "" {
-		c.tlsCertFile = loaded.TLSCertFile
-	}
-	if loaded.TLSKeyFile != "" {
-		c.tlsKeyFile = loaded.TLSKeyFile
+	if err := c.applyTLSSettings(*loaded); err != nil {
+		return valkey.ClientOption{}, "", false, "", err
 	}
 	degrade, healthDegraded := degradedModeFromConfig(*loaded, c.degradedMode, c.healthWhenDegraded)
 	return opts, prefix, degrade, healthDegraded, nil
@@ -668,6 +741,15 @@ func (c *CFValkey) RegisterConfigSources(conf any) error {
 // Shutdown implements cf.CaerusComponent. It closes the valkey client; further
 // use of Client() after shutdown returns the closed client.
 func (c *CFValkey) Shutdown(ctx context.Context) error {
+	c.mu.Lock()
+	stop := c.reconnectCancel
+	c.reconnectCancel = nil
+	c.mu.Unlock()
+	if stop != nil {
+		stop()
+		c.reconnectWG.Wait()
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.logsSub != nil {

@@ -28,30 +28,34 @@ func ParseURL(raw string) (ValkeyConfig, error) {
 		// url.Error.Error interpolates the raw URL (password in userinfo).
 		return zero, errors.New("cf_valkey: parse URL: invalid URL")
 	}
-	switch strings.ToLower(u.Scheme) {
-	case "redis", "rediss", "valkey", "valkeys":
-	default:
-		return zero, fmt.Errorf("cf_valkey: unsupported URL scheme %q", u.Scheme)
-	}
 	host := u.Host
 	if host == "" {
 		return zero, fmt.Errorf("cf_valkey: URL missing host")
 	}
-	cfg := ValkeyConfig{Addresses: []string{host}}
-	if u.User != nil {
-		cfg.Username = u.User.Username()
-		if p, ok := u.User.Password(); ok {
-			cfg.Password = p
+	switch scheme := strings.ToLower(u.Scheme); scheme {
+	case "redis", "rediss", "valkey", "valkeys":
+		cfg := ValkeyConfig{Addresses: []string{host}}
+		if scheme == "rediss" || scheme == "valkeys" {
+			t := true
+			cfg.TLS = &t
 		}
-	}
-	if path := strings.TrimPrefix(u.Path, "/"); path != "" {
-		db, err := strconv.Atoi(path)
-		if err != nil {
-			return zero, fmt.Errorf("cf_valkey: invalid DB path %q: %w", u.Path, err)
+		if u.User != nil {
+			cfg.Username = u.User.Username()
+			if p, ok := u.User.Password(); ok {
+				cfg.Password = p
+			}
 		}
-		cfg.DB = db
+		if path := strings.TrimPrefix(u.Path, "/"); path != "" {
+			db, err := strconv.Atoi(path)
+			if err != nil {
+				return zero, fmt.Errorf("cf_valkey: invalid DB path %q: %w", u.Path, err)
+			}
+			cfg.DB = db
+		}
+		return cfg, nil
+	default:
+		return zero, fmt.Errorf("cf_valkey: unsupported URL scheme %q", u.Scheme)
 	}
-	return cfg, nil
 }
 
 // OverlayURL merges connection fields from a redis/valkey URL into cfg.
@@ -82,6 +86,20 @@ func OverlayURL(cfg *ValkeyConfig, raw string) error {
 		if err == nil && strings.TrimPrefix(u.Path, "/") != "" {
 			cfg.DB = parsed.DB
 		}
+		if err == nil {
+			switch strings.ToLower(u.Scheme) {
+			case "rediss", "valkeys":
+				t := true
+				cfg.TLS = &t
+			case "redis", "valkey":
+				if cfg.TLSCAFile == "" && cfg.TLSCertFile == "" && cfg.TLSKeyFile == "" {
+					f := false
+					cfg.TLS = &f
+				}
+			}
+		}
+	} else if parsed.TLS != nil {
+		cfg.TLS = parsed.TLS
 	}
 	return nil
 }

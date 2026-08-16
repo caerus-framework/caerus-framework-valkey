@@ -59,6 +59,33 @@ func TestValkeyConfigLogArgsNeverCleartext(t *testing.T) {
 	}
 }
 
+func TestParseURLRedissSetsTLS(t *testing.T) {
+	cfg, err := ParseURL("rediss://:secret@valkey.internal:6379")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TLS == nil || !*cfg.TLS {
+		t.Fatal("rediss:// must set TLS true")
+	}
+	cfg2, err := ParseURL("redis://127.0.0.1:6379")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg2.TLS != nil && *cfg2.TLS {
+		t.Fatal("redis:// must not enable TLS")
+	}
+}
+
+func TestOverlayURLRedissEnablesTLS(t *testing.T) {
+	cfg := ValkeyConfig{Addresses: []string{"file:6379"}}
+	if err := OverlayURL(&cfg, "rediss://u:p@env:6380"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TLS == nil || !*cfg.TLS {
+		t.Fatal("overlay rediss:// must set TLS")
+	}
+}
+
 func TestOverlayURL(t *testing.T) {
 	cfg := ValkeyConfig{Addresses: []string{"file:6379"}, DB: 5}
 	if err := OverlayURL(&cfg, "valkey://u:p@env:6380/1"); err != nil {
