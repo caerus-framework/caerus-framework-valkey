@@ -2,6 +2,7 @@ package cf_valkey
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"log/slog"
 	"os"
@@ -201,6 +202,46 @@ func TestDegradedModeAllowsFailedPing(t *testing.T) {
 	_ = v.Shutdown(context.Background())
 }
 
+func TestDegradedModeShutdownStopsReconnect(t *testing.T) {
+	v := New(
+		WithAddress("127.0.0.1:1"),
+		WithPingTimeout(50*time.Millisecond),
+		WithDegradedMode(true),
+	)
+	fw := newFramework(t)
+	if err := v.Init(context.Background(), fw); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = v.Shutdown(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown blocked on reconnect loop")
+	}
+}
+
+func TestApplyTLSFromSchemeWithoutPEM(t *testing.T) {
+	v := New(WithConfig(ValkeyConfig{TLS: boolPtr(true)}))
+	if err := v.applyTLS(&v.opts); err != nil {
+		t.Fatal(err)
+	}
+	if v.opts.TLSConfig == nil {
+		t.Fatal("tls:true without PEM must set TLSConfig")
+	}
+	if v.opts.TLSConfig.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("MinVersion = %v, want TLS 1.2", v.opts.TLSConfig.MinVersion)
+	}
+	if v.opts.TLSConfig.InsecureSkipVerify {
+		t.Fatal("tls must not skip verify by default")
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+
 func TestDegradedModeHealthWhenReady(t *testing.T) {
 	v := New(
 		WithAddress("127.0.0.1:1"),
@@ -291,12 +332,57 @@ func TestBuildTLSConfigInvalidCA(t *testing.T) {
 }
 
 func TestBuildTLSConfigCertWithoutKey(t *testing.T) {
-	dir := t.TempDir()
-	ca := writeTestPEM(t, dir, "ca.pem", testCACert)
-	cert := writeTestPEM(t, dir, "cert.pem", testClientCert)
-	_, err := buildTLSConfig(ca, cert, "")
+	_, err := buildTLSConfig("", "/path/cert.pem", "")
 	if err == nil {
 		t.Fatal("buildTLSConfig with cert but no key should fail")
+	}
+	if !strings.Contains(err.Error(), "must be set together") {
+		t.Fatalf("err = %v, want pair wording", err)
+	}
+}
+
+func TestBuildTLSConfigKeyWithoutCert(t *testing.T) {
+	_, err := buildTLSConfig("", "", "/path/key.pem")
+	if err == nil {
+		t.Fatal("buildTLSConfig with key but no cert should fail")
+	}
+}
+
+func TestMergeTLSFilePathsPair(t *testing.T) {
+	ca, cert, key, err := mergeTLSFilePaths("/old/ca", "/old/cert", "/old/key", ValkeyConfig{
+		TLSCertFile: "/new/cert",
+		TLSKeyFile:  "/new/key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ca != "/old/ca" || cert != "/new/cert" || key != "/new/key" {
+		t.Fatalf("got %s %s %s", ca, cert, key)
+	}
+
+	ca, cert, key, err = mergeTLSFilePaths("/old/ca", "/old/cert", "/old/key", ValkeyConfig{
+		TLSCAFile: "/new/ca",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ca != "/new/ca" || cert != "/old/cert" || key != "/old/key" {
+		t.Fatalf("CA-only overlay got %s %s %s", ca, cert, key)
+	}
+
+	_, _, _, err = mergeTLSFilePaths("/old/ca", "/old/cert", "/old/key", ValkeyConfig{
+		TLSCertFile: "/new/cert",
+	})
+	if err == nil {
+		t.Fatal("half pair must be rejected")
+	}
+
+	v := New(WithTLS("/old/ca", "/old/cert", "/old/key"))
+	if err := v.applyTLSSettings(ValkeyConfig{TLSCertFile: "/new/cert"}); err == nil {
+		t.Fatal("applyTLSSettings half pair must fail")
+	}
+	if v.tlsCertFile != "/old/cert" || v.tlsKeyFile != "/old/key" {
+		t.Fatalf("half overlay mutated pair to %q %q", v.tlsCertFile, v.tlsKeyFile)
 	}
 }
 
