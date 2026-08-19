@@ -4,10 +4,10 @@ go 1.26
 
 require (
 	github.com/caerus-framework/caerus-framework v0.0.12
-	github.com/caerus-framework/caerus-framework-configuration v0.0.12
+	github.com/caerus-framework/caerus-framework-configuration v0.0.13
 	github.com/caerus-framework/caerus-framework-logs v0.0.11
-	github.com/caerus-framework/caerus-framework-observability v0.0.8
-	github.com/valkey-io/valkey-go v1.0.76
+	github.com/caerus-framework/caerus-framework-observability v0.0.11
+	github.com/valkey-io/valkey-go v1.0.77
 	golang.org/x/sync v0.22.0
 )
 
@@ -46,4 +46,3 @@ require (
 )
 
 tool github.com/caerus-framework/caerus-framework/cmd/caerusvet
-
