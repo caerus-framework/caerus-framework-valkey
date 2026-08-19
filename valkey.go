@@ -691,15 +691,15 @@ func (c *CFValkey) clientOptsFromSource() (valkey.ClientOption, string, bool, st
 		return valkey.ClientOption{}, "", false, "", fmt.Errorf("cf_valkey: configuration source %q not found", c.configSource)
 	}
 	opts := c.baseOpts
-	applyLoadedConfig(&opts, *loaded)
+	applyLoadedConfig(&opts, loaded)
 	prefix := c.basePrefix
 	if loaded.KeyPrefix != "" {
 		prefix = loaded.KeyPrefix
 	}
-	if err := c.applyTLSSettings(*loaded); err != nil {
+	if err := c.applyTLSSettings(loaded); err != nil {
 		return valkey.ClientOption{}, "", false, "", err
 	}
-	degrade, healthDegraded := degradedModeFromConfig(*loaded, c.degradedMode, c.healthWhenDegraded)
+	degrade, healthDegraded := degradedModeFromConfig(loaded, c.degradedMode, c.healthWhenDegraded)
 	return opts, prefix, degrade, healthDegraded, nil
 }
 
