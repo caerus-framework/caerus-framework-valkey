@@ -1,6 +1,7 @@
 package cf_valkey
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"io"
@@ -237,6 +238,59 @@ func TestApplyTLSFromSchemeWithoutPEM(t *testing.T) {
 	}
 	if v.opts.TLSConfig.InsecureSkipVerify {
 		t.Fatal("tls must not skip verify by default")
+	}
+}
+
+func metricNamed(t *testing.T, ms []cf_observability.Metric, name string) float64 {
+	t.Helper()
+	for _, m := range ms {
+		if m.Name == name {
+			return m.Value
+		}
+	}
+	t.Fatalf("missing metric %s", name)
+	return 0
+}
+
+func TestTLSInsecureSkipVerifyScreams(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	v := New(
+		WithAddress("127.0.0.1:1"),
+		WithPingTimeout(50*time.Millisecond),
+		WithDegradedMode(true),
+		WithTLSInsecureSkipVerify(true),
+		WithConfig(ValkeyConfig{TLS: boolPtr(true)}),
+		WithLogger(log),
+	)
+	if err := v.Init(context.Background(), newFramework(t)); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(func() { _ = v.Shutdown(context.Background()) })
+	if !strings.Contains(buf.String(), "tls_insecure_skip_verify is on") {
+		t.Fatalf("expected error log for skip-verify, got:\n%s", buf.String())
+	}
+	if v.opts.TLSConfig == nil || !v.opts.TLSConfig.InsecureSkipVerify {
+		t.Fatal("TLSConfig should skip verify when the switch is on")
+	}
+	if got := metricNamed(t, v.Metrics(), "valkey_tls_insecure_skip_verify"); got != 1 {
+		t.Fatalf("valkey_tls_insecure_skip_verify = %v, want 1", got)
+	}
+}
+
+func TestTLSInsecureSkipVerifyGaugeOff(t *testing.T) {
+	v := New(
+		WithAddress("127.0.0.1:1"),
+		WithPingTimeout(50*time.Millisecond),
+		WithDegradedMode(true),
+		WithConfig(ValkeyConfig{TLS: boolPtr(true)}),
+	)
+	if err := v.Init(context.Background(), newFramework(t)); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(func() { _ = v.Shutdown(context.Background()) })
+	if got := metricNamed(t, v.Metrics(), "valkey_tls_insecure_skip_verify"); got != 0 {
+		t.Fatalf("valkey_tls_insecure_skip_verify = %v, want 0", got)
 	}
 }
 
