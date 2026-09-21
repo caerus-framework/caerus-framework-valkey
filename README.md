@@ -116,6 +116,21 @@ written against `Key` runs unchanged with or without a prefix. `KeyPrefix()`
 returns the configured prefix, and `Key()` is safe to call before `Init`
 (it never touches the server).
 
+The prefix is **identity**, not a live tunable (pool size, timeout, and
+similar numbers are tunables; this string is “which keys belong to this
+instance”). Changing it is a **migration**: keys already written stay
+under the old prefix; this module does not rename them. A config reload
+that changes `key_prefix` logs at **error** so the change is not silent.
+Plan a dual-read or a copy job, then cut over. Do not bounce the setting
+to “fix collisions” the way you would tune `max_conns`.
+
+```text
+Wrong: change key_prefix in the live file and expect sessions/counters
+       to follow.
+Right: treat a prefix change like a database rename — migrate data, then
+       switch the setting (or start a new named instance).
+```
+
 ## Options
 
 | Option | Description |
@@ -127,14 +142,14 @@ returns the configured prefix, and `Key()` is safe to call before `Init`
 | `WithUsername(u)` / `WithPassword(p)` | AUTH credentials |
 | `WithDB(n)` | logical database selection |
 | `WithClientName(name)` | `CLIENT SETNAME` on connections |
-| `WithKeyPrefix(prefix)` | scope all keys (see above); trailing `:` trimmed |
+| `WithKeyPrefix(prefix)` | namespace for `Key()`; trailing `:` trimmed. Identity, not a live tunable — changing it is a migration. |
 | `WithPingTimeout(d)` | Init connectivity-ping timeout (default `5s`) |
 | `WithDegradedMode(bool)` | when true, Init may succeed without a live ping (default **off** / hard-fail) |
 | `WithHealthWhenDegraded("not_ready"\|"ready")` | `/readyz` while degraded: default `not_ready`; `ready` is break-glass LB traffic |
 | `WithName(name)` | custom component name for multiple instances (default `"valkey"`) |
 | `WithLogger(*slog.Logger)` | explicit logger override; defaults to the framework `logs` component's logger (re-delivered on `logs` `Reconfigure`), falling back to `slog.Default()` |
 | `WithTLS(caFile, certFile, keyFile)` | TLS from PEM file paths (Kubernetes-mounted secrets); CA for server verification, cert+key for mTLS |
-| `WithTLSInsecureSkipVerify(true)` | skip cert verify (lab only; not implied by `rediss://`) |
+| `WithTLSInsecureSkipVerify(true)` | skip cert verify. Lab only. Error log + `valkey_tls_insecure_skip_verify=1`. Never production Path B. Not implied by `rediss://`. |
 | `WithDialTimeout(d)` | TCP dial timeout |
 | `WithConnWriteTimeout(d)` | per-connection read/write timeout; bounds pipeline waits and triggers periodic PINGs |
 | `WithConnLifetime(d)` | maximum connection lifetime; zero means no limit |
@@ -271,6 +286,7 @@ contributes samples to `/metrics`:
 | `valkey_degraded_mode_uses_total` | counter | same |
 | `valkey_ping_failures_total` | counter | same |
 | `valkey_reconnects_total` | counter | same |
+| `valkey_tls_insecure_skip_verify` | gauge | `1` when skip-verify is on (lab; AUTH is MITM-able) |
 | `valkey_lock_acquire_ok_total` | counter | same |
 | `valkey_lock_acquire_busy_total` | counter | same |
 | `valkey_lock_unlock_ok_total` | counter | same |
@@ -392,24 +408,64 @@ compose with `Mutex` for cross-pod coalescing.
 
 ## TLS
 
-Two different things:
+Default client config is often **plaintext** (`redis://` / `valkey://`,
+no `tls: true`). That is a laptop default, not a Kubernetes default.
+ClusterIP plus AUTH still puts the password on the overlay network unless
+you pick **one** of the two cluster paths below. Do not write “TLS or
+mesh” as one bullet — the Helm chart must name which path it is.
 
-| | What it means |
-|---|---|
-| **URL scheme** `rediss://` / `valkeys://` | This URL **wants TLS**. The client gets `TLSConfig` (MinVersion 1.2, system roots) even with **no** PEM files. `redis://` / `valkey://` do not enable TLS by themselves. |
-| **PEM files** | Custom CA and/or mTLS. Files win for trust material. Re-read on reload / reconnect. |
+```mermaid
+flowchart TD
+  q{Who encrypts the Valkey hop?}
+  q -->|service mesh mTLS| a["Path A: client tls off"]
+  q -->|this process| b["Path B: tls true or rediss://"]
+```
 
-Client cert and key are a **pair** (same rule as postgresql): both set, both
-empty, or the overlay is rejected and last-good stays. Do not set only
-`tls_cert_file` or only `tls_key_file` (env or JSON). CA (`tls_ca_file`)
-rotates on its own.
+### Path A — Mesh TLS (Istio / Linkerd / Cilium mTLS)
+
+The **mesh** encrypts pod-to-Valkey (or pod-to-Valkey-sidecar). The
+Valkey client keeps `tls` off and uses `redis://` / `valkey://`. Product
+Helm that uses Path A must actually have STRICT (or equivalent) Peer
+Authentication on that port — a mesh installed but Permissive is not
+Path A.
+
+```yaml
+# values.yaml — Path A (mesh encrypts)
+valkey:
+  addresses:
+    - valkey:6379
+  # tls: false / omitted — client does not speak TLS
+  # do not set rediss://
+```
+
+### Path B — App TLS
+
+This process speaks TLS to Valkey: `tls: true`, or `rediss://` /
+`valkeys://` (those schemes set `tls: true`). Add `tls_ca_file` when the
+CA is not public PKI. PEM files win for trust material; files are
+re-read on reload / reconnect.
+
+```yaml
+# values.yaml — Path B (app TLS)
+valkey:
+  addresses:
+    - valkey:6379
+  tls: true
+  tls_ca_file: /var/run/secrets/valkey-ca/ca.crt
+  # tls_cert_file + tls_key_file together for mTLS
+  # never tls_insecure_skip_verify in production Path B
+```
+
+Or `VALKEY_URL=rediss://valkey:6379` (still Path B).
+
+Client cert and key are a **pair** (same rule as postgresql): both set,
+both empty, or the overlay is rejected and last-good stays. Do not set
+only `tls_cert_file` or only `tls_key_file`. CA (`tls_ca_file`) rotates
+on its own.
 
 Kubernetes layout (cert-manager / `kubernetes.io/tls`): mount `ca.crt`,
-`tls.crt`, and `tls.key`; point the three settings at those paths. A Secret
-update that replaces the files is picked up on the next reload.
-
-`tls_insecure_skip_verify` is a **named switch** for broken lab certs. It is
-**not** implied by `rediss://`.
+`tls.crt`, and `tls.key`; point the three settings at those paths. A
+Secret update that replaces the files is picked up on the next reload.
 
 ```go
 vk := cf_valkey.New(
@@ -418,7 +474,36 @@ vk := cf_valkey.New(
 )
 ```
 
-Or `tls: true` in JSON, or `VALKEY_URL=rediss://host:6379`.
+```text
+Wrong: omit tls in the serve chart and assume ClusterIP is encrypted.
+Right: pick Path A (mesh STRICT) or Path B (tls: true / rediss://) in
+       that chart — one named path, not both mixed in one snippet.
+
+Wrong: Path B plus tls_insecure_skip_verify: true in production.
+Right: skip-verify is lab only (see below). Path B verifies the cert.
+```
+
+| | What it means |
+|---|---|
+| **URL scheme** `rediss://` / `valkeys://` | This URL **wants TLS** (Path B). The client gets `TLSConfig` (MinVersion 1.2, system roots) even with **no** PEM files. `redis://` / `valkey://` do not enable TLS by themselves. |
+| **PEM files** | Custom CA and/or mTLS on Path B. Files win for trust material. Re-read on reload / reconnect. |
+| **Mesh (Path A)** | Encryption is outside this client. Do not also set `tls: true` unless you intend Path B (double TLS). |
+
+### `tls_insecure_skip_verify` (lab only)
+
+This is a **named switch** for broken lab certs. It is **not** implied by
+`rediss://`. It is **never** production Path B.
+
+When the switch is on, this module **screams** the same way DegradedMode
+does: an **error** log at Init and on reload, and a `1` gauge
+`valkey_tls_insecure_skip_verify` on `/metrics`. Dashboards should alert
+on that series in any environment that is not a named lab.
+
+```text
+Wrong: tls: true and tls_insecure_skip_verify: true on a serve pod
+       because the cert hostname does not match.
+Right: fix the cert (Path B) or use Path A mesh. Skip-verify is MITM-able AUTH.
+```
 
 With `degraded_mode`, a failed Init ping does not abort. A background loop
 retries ping/rebuild (backoff + jitter) until the server is up or Shutdown.

@@ -37,21 +37,27 @@ const (
 // through the configuration component (caerus-framework-configuration) and
 // pass it via WithConfig; both JSON and YAML tags are provided.
 type ValkeyConfig struct {
-	Addresses   []string `json:"addresses" yaml:"addresses" env:"ADDRESSES"`
-	Username    string   `json:"username,omitempty" yaml:"username,omitempty" env:"USERNAME"`
-	Password    string   `json:"password,omitempty" yaml:"password,omitempty" env:"PASSWORD" secret:"redact"`
-	DB          int      `json:"db" yaml:"db" env:"DB"`
-	ClientName  string   `json:"client_name,omitempty" yaml:"client_name,omitempty" env:"CLIENT_NAME"`
-	KeyPrefix   string   `json:"key_prefix,omitempty" yaml:"key_prefix,omitempty" env:"KEY_PREFIX"`
-	TLSCAFile   string   `json:"tls_ca_file,omitempty" yaml:"tls_ca_file,omitempty" env:"TLS_CA_FILE"`
-	TLSCertFile string   `json:"tls_cert_file,omitempty" yaml:"tls_cert_file,omitempty" env:"TLS_CERT_FILE"`
-	TLSKeyFile  string   `json:"tls_key_file,omitempty" yaml:"tls_key_file,omitempty" env:"TLS_KEY_FILE"`
+	Addresses  []string `json:"addresses" yaml:"addresses" env:"ADDRESSES"`
+	Username   string   `json:"username,omitempty" yaml:"username,omitempty" env:"USERNAME"`
+	Password   string   `json:"password,omitempty" yaml:"password,omitempty" env:"PASSWORD" secret:"redact"`
+	DB         int      `json:"db" yaml:"db" env:"DB"`
+	ClientName string   `json:"client_name,omitempty" yaml:"client_name,omitempty" env:"CLIENT_NAME"`
+	// KeyPrefix namespaces keys this instance writes (WithKeyPrefix / Key()).
+	// It is identity, not a live tunable: changing it is a migration (old keys
+	// stay under the old prefix). Reload that changes it logs at error level.
+	KeyPrefix   string `json:"key_prefix,omitempty" yaml:"key_prefix,omitempty" env:"KEY_PREFIX"`
+	TLSCAFile   string `json:"tls_ca_file,omitempty" yaml:"tls_ca_file,omitempty" env:"TLS_CA_FILE"`
+	TLSCertFile string `json:"tls_cert_file,omitempty" yaml:"tls_cert_file,omitempty" env:"TLS_CERT_FILE"`
+	TLSKeyFile  string `json:"tls_key_file,omitempty" yaml:"tls_key_file,omitempty" env:"TLS_KEY_FILE"`
 	// TLS enables TLS with system roots (MinVersion 1.2) when no PEM files
 	// are set. ParseURL/OverlayURL set this for rediss:// and valkeys://.
 	// PEM files still win for custom CA / mTLS.
 	TLS *bool `json:"tls,omitempty" yaml:"tls,omitempty" env:"TLS"`
 	// TLSInsecureSkipVerify skips certificate verify. Lab/broken certs only;
-	// never the default. Explicit setting, not implied by rediss://.
+	// never the default; never production Path B (app TLS). Explicit setting,
+	// not implied by rediss://. When true, Init/reload log at error and
+	// /metrics exposes valkey_tls_insecure_skip_verify=1 (same scream bar as
+	// DegradedMode).
 	TLSInsecureSkipVerify *bool   `json:"tls_insecure_skip_verify,omitempty" yaml:"tls_insecure_skip_verify,omitempty" env:"TLS_INSECURE_SKIP_VERIFY"`
 	DialTimeoutSec        float64 `json:"dial_timeout_sec,omitempty" yaml:"dial_timeout_sec,omitempty" env:"DIAL_TIMEOUT_SEC"`
 	ConnWriteTimeoutSec   float64 `json:"conn_write_timeout_sec,omitempty" yaml:"conn_write_timeout_sec,omitempty" env:"CONN_WRITE_TIMEOUT_SEC"`
@@ -194,9 +200,11 @@ func WithClientName(name string) Option {
 }
 
 // WithKeyPrefix sets a namespace prefix applied by Key to every key this
-// component's users build. Useful when several services or environments share
-// one instance. The prefix is trimmed of a trailing ":"; an empty prefix keeps
-// Key a plain ":"-join.
+// component's users build. Several services can share one Valkey without
+// collisions. The prefix is identity, not a pool-size-style tunable: changing
+// it is a **migration** (existing keys stay under the old prefix; they are
+// not rewritten). Trailing ":" is trimmed; an empty prefix keeps Key a
+// plain ":"-join.
 func WithKeyPrefix(prefix string) Option {
 	return func(o *options) { o.keyPrefix = prefix }
 }
@@ -236,8 +244,10 @@ func WithTLS(tlsCAFile, tlsCertFile, tlsKeyFile string) Option {
 	}
 }
 
-// WithTLSInsecureSkipVerify skips server certificate verification. Use only
-// for broken lab certs; rediss:// does not turn this on by itself.
+// WithTLSInsecureSkipVerify skips server certificate verification. Lab /
+// broken certs only. Never production Path B (app TLS). rediss:// does not
+// turn this on by itself. When true, Init and reload log at error and
+// Metrics exposes valkey_tls_insecure_skip_verify=1.
 func WithTLSInsecureSkipVerify(skip bool) Option {
 	return func(o *options) { o.tlsInsecure = skip }
 }
@@ -512,6 +522,7 @@ func (c *CFValkey) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 	if err := c.applyTLS(&c.opts); err != nil {
 		return err
 	}
+	c.screamTLSInsecureLocked()
 
 	client, err := valkey.NewClient(c.opts)
 	if err != nil {
@@ -630,6 +641,18 @@ func (c *CFValkey) applyTLS(opts *valkey.ClientOption) error {
 	return nil
 }
 
+// screamTLSInsecureLocked logs at error when skip-verify is on. Callers must
+// hold c.mu. Same bar as DegradedMode: operators must see this on day-one
+// dashboards, not only in a README footnote.
+func (c *CFValkey) screamTLSInsecureLocked() {
+	if !c.tlsInsecure {
+		return
+	}
+	c.logger.Error("cf_valkey: tls_insecure_skip_verify is on — server cert is not verified; AUTH is MITM-able. Lab only. Never production Path B (app TLS).",
+		"component", c.Name(),
+	)
+}
+
 // OnConfigReload implements cf.ConfigReloader. It rebuilds the client from the
 // bound configuration source. The fresh value is delivered as cfg but the
 // client is rebuilt from the source so the translation stays in one place. On
@@ -650,6 +673,13 @@ func (c *CFValkey) OnConfigReload(source string, cfg any) {
 	if err := c.applyTLS(&opts); err != nil {
 		c.logger.Error("cf_valkey: config reload TLS rejected", "err", err)
 		return
+	}
+	c.screamTLSInsecureLocked()
+	if prefix != c.keyPrefix {
+		c.logger.Error("cf_valkey: key_prefix changed on reload — this is a key identity migration, not a live tunable; existing keys under the old prefix are not rewritten",
+			"from", c.keyPrefix,
+			"to", prefix,
+		)
 	}
 	newClient, err := valkey.NewClient(opts)
 	if err != nil {
@@ -905,6 +935,10 @@ func (c *CFValkey) Metrics() []cf_observability.Metric {
 	if c.degradedUnreachable.Load() {
 		degraded = 1
 	}
+	tlsInsecure := 0.0
+	if c.tlsInsecure {
+		tlsInsecure = 1
+	}
 	labels := map[string]string{
 		"addresses": strings.Join(c.opts.InitAddress, ","),
 		"db":        strconv.Itoa(c.opts.SelectDB),
@@ -954,6 +988,12 @@ func (c *CFValkey) Metrics() []cf_observability.Metric {
 			Value:  float64(c.reconnects.Load()),
 			Labels: copyLabels(labels),
 			Type:   cf_observability.MetricTypeCounter,
+		},
+		{
+			Name:   "valkey_tls_insecure_skip_verify",
+			Help:   "1 when tls_insecure_skip_verify is on (lab only; AUTH is MITM-able).",
+			Value:  tlsInsecure,
+			Labels: copyLabels(labels),
 		},
 	}
 	if c.Client() != nil {
